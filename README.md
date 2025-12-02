@@ -1,2 +1,298 @@
-# ciphergram
-Ciphergram is a secure, ephemeral chat platform that uses end‑to‑end encryption and randomized alphabets derived per session. Users join rooms with a shared code, exchange ciphertext relayed only by the server, and view messages rendered in unique symbol mappings. All keys, mappings, and history are wiped when the chat ends.
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Ciphergram — Secure Ephemeral Chat</title>
+  <style>
+    :root {
+      --bg1:#0f172a; --bg2:#1e293b; --text:#e5e7eb; --muted:#94a3b8;
+      --acc1:#22d3ee; --acc2:#a78bfa; --card:rgba(255,255,255,0.06); --border:rgba(255,255,255,0.1);
+    }
+    * { box-sizing:border-box; }
+    body {
+      margin:0; min-height:100vh; color:var(--text);
+      background: radial-gradient(1200px 400px at 10% 10%, rgba(34,211,238,0.12), transparent 50%),
+                  radial-gradient(900px 300px at 90% 30%, rgba(167,139,250,0.15), transparent 55%),
+                  linear-gradient(180deg, var(--bg1), var(--bg2) 70%, #0b1020);
+      font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, "Helvetica Neue", Arial;
+    }
+    .wrap { max-width:980px; margin:0 auto; padding:40px 22px 64px; }
+    header { display:flex; justify-content:space-between; align-items:center; margin-bottom:24px; }
+    .brand { display:flex; gap:12px; align-items:center; }
+    .logo { width:36px; height:36px; border-radius:10px; background: conic-gradient(from 180deg, var(--acc1), var(--acc2)); box-shadow:0 8px 24px rgba(167,139,250,0.25); }
+    .title { font-weight:700; }
+    .muted { color:var(--muted); font-size:12px; }
+    .card { background:var(--card); border:1px solid var(--border); border-radius:16px; padding:20px; backdrop-filter:blur(6px); }
+    .grid { display:grid; gap:16px; grid-template-columns:1fr; }
+    @media (min-width:900px){ .grid { grid-template-columns: 0.9fr 1.1fr; } }
+    label { display:block; font-size:12px; color:var(--muted); margin-bottom:6px; }
+    input, textarea, button {
+      width:100%; background:#0b1222; border:1px solid var(--border); color:var(--text);
+      border-radius:12px; padding:10px 12px; font-size:14px;
+    }
+    textarea { min-height:120px; resize:vertical; }
+    .row { display:grid; grid-template-columns:1fr 1fr; gap:12px; margin-top:8px; }
+    button.primary { background: linear-gradient(135deg, var(--acc1), var(--acc2)); border:none; color:#0b1020; font-weight:700; cursor:pointer; }
+    .mono { font-family: ui-monospace, Menlo, Consolas, "Courier New", monospace; white-space:pre-wrap; word-break:break-word; }
+    .log { min-height:200px; background:#0b1222; border-radius:12px; padding:10px; }
+    .small { font-size:12px; color:var(--muted); }
+    .pill { display:inline-block; padding:4px 8px; border-radius:999px; background:#0b1222; border:1px solid var(--border); font-size:12px; margin-left:8px; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <div class="brand">
+        <div class="logo"></div>
+        <div>
+          <div class="title">Ciphergram — Secure Ephemeral Chat</div>
+          <div class="muted">E2E encryption; per-message randomized alphabet; wipes keys on leave</div>
+        </div>
+      </div>
+      <div>
+        <span id="status" class="pill">Disconnected</span>
+        <button class="primary" id="leaveBtn" style="margin-left:8px;">Leave & Wipe</button>
+      </div>
+    </header>
+
+    <div class="grid">
+      <div class="card">
+        <label>WebSocket backend URL</label>
+        <input id="wsUrl" placeholder="wss://YOUR_BACKEND_URL" />
+
+        <label style="margin-top:12px;">Room code (shared secret)</label>
+        <input id="roomCode" placeholder="Enter room code (e.g., SUNFLOWER-123)" />
+
+        <div class="row">
+          <button class="primary" id="connectBtn">Connect</button>
+          <button id="joinBtn">Join room</button>
+        </div>
+
+        <label style="margin-top:16px;">Your message (plaintext)</label>
+        <textarea id="msgIn" placeholder="Type and send..."></textarea>
+
+        <div class="row">
+          <button class="primary" id="sendBtn">Encrypt & Send</button>
+          <button id="clearBtn">Clear</button>
+        </div>
+      </div>
+
+      <div class="card">
+        <label>Chat (decrypted, rendered with randomized alphabet)</label>
+        <div id="chatOut" class="mono log"></div>
+
+        <label style="margin-top:12px;">Last transport payload (ciphertext)</label>
+        <div id="cipherOut" class="mono small"></div>
+
+        <label style="margin-top:12px;">Alphabet mapping for last message (ASCII printable)</label>
+        <div id="mapOut" class="mono small"></div>
+      </div>
+    </div>
+
+    <div class="card" style="margin-top:16px;">
+      <label>Notes</label>
+      <div class="small">
+        - This client derives an AES-GCM key from the room code (demo-grade PBKDF2).<br/>
+        - The server should relay ciphertext only. It cannot read messages.<br/>
+        - The alphabet mapping covers ASCII printable characters (space through ~).<br/>
+        - Leaving wipes keys, seeds, counters, and UI traces locally.
+      </div>
+    </div>
+  </div>
+
+  <script>
+    // ===== State =====
+    const state = {
+      ws: null,
+      wsUrl: "",
+      joinedRoom: null,
+      cryptoKey: null,    // AES-GCM key
+      roomSeed: null,     // seed for alphabet
+      msgIndex: 0         // per-message counter
+    };
+
+    // ===== UI refs =====
+    const statusEl = document.getElementById("status");
+    const wsUrlEl = document.getElementById("wsUrl");
+    const roomCodeEl = document.getElementById("roomCode");
+    const connectBtn = document.getElementById("connectBtn");
+    const joinBtn = document.getElementById("joinBtn");
+    const leaveBtn = document.getElementById("leaveBtn");
+    const msgIn = document.getElementById("msgIn");
+    const sendBtn = document.getElementById("sendBtn");
+    const clearBtn = document.getElementById("clearBtn");
+    const chatOut = document.getElementById("chatOut");
+    const cipherOut = document.getElementById("cipherOut");
+    const mapOut = document.getElementById("mapOut");
+
+    function setStatus(text, ok=false) {
+      statusEl.textContent = text;
+      statusEl.style.borderColor = ok ? "rgba(34,211,238,0.5)" : "var(--border)";
+      statusEl.style.background = ok ? "rgba(34,211,238,0.15)" : "#0b1222";
+    }
+
+    // ===== Alphabet: ASCII printable coverage (0x20 to 0x7E) =====
+    const BASE_ALPHABET = (() => {
+      const arr = [];
+      for (let i = 0x20; i <= 0x7E; i++) arr.push(String.fromCharCode(i));
+      return arr;
+    })();
+
+    // ===== PRNG + shuffle =====
+    function xorshift32(seedStr) {
+      let s = 0;
+      for (let i = 0; i < seedStr.length; i++) s = (s ^ seedStr.charCodeAt(i)) >>> 0;
+      if (s === 0) s = 2463534242;
+      return () => {
+        s ^= s << 13; s >>>= 0;
+        s ^= s >>> 17; s >>>= 0;
+        s ^= s << 5; s >>>= 0;
+        return (s >>> 0) / 0xFFFFFFFF;
+      };
+    }
+    function shuffle(arr, rnd) {
+      const a = arr.slice();
+      for (let i = a.length - 1; i > 0; i--) {
+        const j = Math.floor(rnd() * (i + 1));
+        [a[i], a[j]] = [a[j], a[i]];
+      }
+      return a;
+    }
+    function buildMapping(seed, index) {
+      const rnd = xorshift32(`${seed}#${index}`);
+      const target = shuffle(BASE_ALPHABET, rnd);
+      const map = new Map();
+      for (let i = 0; i < BASE_ALPHABET.length; i++) map.set(BASE_ALPHABET[i], target[i]);
+      return { base: BASE_ALPHABET, target, map };
+    }
+    function applyMapping(text, map) {
+      const tokens = text.split(/(\s+)/);
+      return tokens.map(tok => {
+        if (/^(https?:\/\/|www\.)/i.test(tok)) return tok; // don't break URLs
+        let out = "";
+        for (const ch of tok) out += map.get(ch) ?? ch;
+        return out;
+      }).join("");
+    }
+
+    // ===== WebCrypto (AES-GCM, PBKDF2) =====
+    async function deriveKeyFromCode(code) {
+      const enc = new TextEncoder();
+      const salt = enc.encode("ciphergram-salt-v1"); // demo: static; production: random per room
+      const baseKey = await crypto.subtle.importKey("raw", enc.encode(code), { name: "PBKDF2" }, false, ["deriveKey"]);
+      return crypto.subtle.deriveKey(
+        { name: "PBKDF2", hash: "SHA-256", salt, iterations: 150000 },
+        baseKey,
+        { name: "AES-GCM", length: 256 },
+        false,
+        ["encrypt", "decrypt"]
+      );
+    }
+    async function encryptAesGcm(key, plaintext) {
+      const iv = crypto.getRandomValues(new Uint8Array(12));
+      const ct = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, new TextEncoder().encode(plaintext));
+      return { iv: Array.from(iv), data: Array.from(new Uint8Array(ct)) };
+    }
+    async function decryptAesGcm(key, payload) {
+      const { iv, data } = payload;
+      const pt = await crypto.subtle.decrypt({ name: "AES-GCM", iv: new Uint8Array(iv) }, key, new Uint8Array(data));
+      return new TextDecoder().decode(pt);
+    }
+
+    // ===== WebSocket connect/join/send handlers =====
+    connectBtn.addEventListener("click", () => {
+      const url = wsUrlEl.value.trim();
+      if (!url) { alert("Enter your WebSocket backend URL (wss://...)"); return; }
+      if (state.ws && state.ws.readyState === WebSocket.OPEN) { alert("Already connected."); return; }
+
+      state.wsUrl = url;
+      state.ws = new WebSocket(url);
+
+      state.ws.addEventListener("open", () => setStatus("Connected", true));
+      state.ws.addEventListener("close", () => setStatus("Disconnected"));
+      state.ws.addEventListener("error", () => setStatus("Error connecting"));
+
+      state.ws.addEventListener("message", async (event) => {
+        let msg;
+        try { msg = JSON.parse(event.data); } catch { return; }
+
+        if (msg.type === "joined") return;
+
+        if (msg.type === "msg" && msg.payload) {
+          if (!state.cryptoKey || !state.roomSeed) return;
+
+          const plaintext = await decryptAesGcm(state.cryptoKey, msg.payload);
+          const { base, target, map } = buildMapping(state.roomSeed, state.msgIndex);
+          const rendered = applyMapping(plaintext, map);
+
+          chatOut.textContent += rendered + "\n";
+          cipherOut.textContent = JSON.stringify(msg.payload, null, 2);
+          mapOut.textContent = base.map((b, i) => `${b} → ${target[i]}`).join("\n");
+
+          state.msgIndex++;
+        }
+      });
+    });
+
+    joinBtn.addEventListener("click", async () => {
+      if (!state.ws || state.ws.readyState !== WebSocket.OPEN) { alert("Connect to backend first."); return; }
+      const code = roomCodeEl.value.trim();
+      if (!code) { alert("Enter a room code"); return; }
+      state.cryptoKey = await deriveKeyFromCode(code);
+      state.roomSeed = code;
+      state.msgIndex = 0;
+      state.joinedRoom = code;
+      chatOut.textContent = "";
+      cipherOut.textContent = "";
+      mapOut.textContent = "";
+
+      state.ws.send(JSON.stringify({ type: "join", room: code }));
+      alert("Joined room. Keys and mapping seed created locally.");
+    });
+
+    sendBtn.addEventListener("click", async () => {
+      if (!state.cryptoKey || !state.joinedRoom) { alert("Join a room first."); return; }
+      const plaintext = msgIn.value;
+      if (!plaintext) return;
+
+      const payload = await encryptAesGcm(state.cryptoKey, plaintext);
+
+      // Send ciphertext; server relays to room participants
+      state.ws.send(JSON.stringify({ type: "msg", room: state.joinedRoom, payload }));
+
+      // Show locally as well
+      const decrypted = await decryptAesGcm(state.cryptoKey, payload);
+      const { base, target, map } = buildMapping(state.roomSeed, state.msgIndex);
+      const rendered = applyMapping(decrypted, map);
+
+      chatOut.textContent += rendered + "\n";
+      cipherOut.textContent = JSON.stringify(payload, null, 2);
+      mapOut.textContent = base.map((b, i) => `${b} → ${target[i]}`).join("\n");
+
+      state.msgIndex++;
+      msgIn.value = "";
+    });
+
+    clearBtn.addEventListener("click", () => { msgIn.value = ""; });
+
+    leaveBtn.addEventListener("click", () => {
+      try { state.ws && state.ws.close(); } catch {}
+      state.ws = null;
+      state.wsUrl = "";
+      state.joinedRoom = null;
+      state.cryptoKey = null;
+      state.roomSeed = null;
+      state.msgIndex = 0;
+      wsUrlEl.value = "";
+      roomCodeEl.value = "";
+      msgIn.value = "";
+      chatOut.textContent = "";
+      cipherOut.textContent = "";
+      mapOut.textContent = "";
+      setStatus("Disconnected");
+      alert("Left room. Keys, mapping, and messages cleared.");
+    });
+  </script>
+</body>
+</html>
